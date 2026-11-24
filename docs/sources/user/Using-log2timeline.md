@@ -1,0 +1,323 @@
+# Using log2timeline.py
+
+**log2timeline** is a command line tool to extract [events](Scribbles-about-events.md#what-is-an-event)
+from individual files, recursing a directory, for example a mount point, or
+storage media image or device. log2timeline creates a Plaso storage file which
+can be analyzed with the pinfo and psort tools.
+
+The Plaso storage file contains the extracted events and various metadata about
+the collection process alongside information collected from the source data. It
+may also contain information about tags applied to events and reports from
+analysis plugins.
+
+To get a complete list of all switches and parameters of log2timeline.py, use
+``-h`` or ``--help``.
+
+This guide will cover the most basic options and then discuss some of the
+perhaps less used ones.
+
+## Common options
+
+* **-z TIME_ZONE**, **--timezone TIME_ZONE**: time zone of date and time values in the source data that are stored without a time zone indicator, such as "UTC" or "Europe/Amsterdam". By default the time zone is determined from the source data where possible, otherwise UTC is used. Use `-z list` to list the supported time zones.
+* **--archives TYPES**: comma separated list of archive and storage media image types, such as `tar,zip`, for which to process embedded file entries. Use `--archives list` to list the supported types. Note that this can make processing significantly slower.
+* **--hashers HASHER_LIST**: comma separated list of hashers to use, such as `md5,sha256`. Use `--hashers list` to list the supported hashers.
+* **--yara_rules PATH**: path to a file containing Yara rules definitions to match against the content of files.
+* **--workers WORKERS**: number of worker processes. The default is the number of available system CPUs minus one, for the main (foreman) process.
+* **--temporary_directory DIRECTORY**: directory to store temporary files created during processing.
+* **--status_view TYPE**: processing status view mode: "file", "linear", "none" or "window".
+* **--unattended**: log2timeline.py will error instead of prompting the user.
+
+## Basic usage
+
+The simplest way, and perhaps the most common way to run log2timeline.py without
+any additional parameters, only defining the output and input. The output is
+the path and filename of the storage file while the input is the location of
+the source, whether that is a single file, a storage media image or a directory
+such as a mount point. log2timeline.py will go through the entire data set and
+produce a timeline with a predefined set of parsers, containing information
+extracted from all discovered file entries and supported file formats.
+
+```bash
+$ log2timeline.py --storage-file OUTPUT INPUT
+```
+
+For example:
+
+```bash
+$ log2timeline.py --storage-file timeline.plaso /PATH/image.E01
+2021-05-09 10:15:19,162 [INFO] (MainProcess) PID:3143504 <artifact_definitions> Determined artifact definitions path: /usr/share/artifacts/
+Checking availability and versions of dependencies.
+[OK]
+
+
+Source path     : /PATH/image.E01
+Source type     : storage media image
+Processing time : 00:00:00
+
+Processing started.
+```
+
+```bash
+plaso - log2timeline version 20210412
+
+Source path     : /PATH/image.E01
+Source type     : storage media image
+Processing time : 00:04:57
+
+Tasks:          Queued  Processing      Merging         Abandoned       Total
+                0       0               0               0               18675
+
+Identifier      PID     Status          Memory          Sources         Events          File
+Main            3143050 completed       1.3 GiB         18675 (0)       499347 (0)
+Worker_00       3143054 idle            1.2 GiB         3275 (0)        101555 (0)      NTFS:\WINDOWS\$NtServicePackUninstall$
+Worker_01       3143056 idle            1.2 GiB         4246 (0)        42476 (0)       NTFS:\WINDOWS\ie7
+Worker_02       3143058 idle            1.2 GiB         675 (0)         63234 (0)       NTFS:\WINDOWS\inf
+Worker_03       3143060 idle            1.2 GiB         350 (0)         57190 (0)       NTFS:\pagefile.sys
+Worker_04       3143064 idle            1.2 GiB         3876 (0)        103856 (0)      NTFS:\hiberfil.sys
+Worker_05       3143068 idle            1.2 GiB         1985 (0)        64947 (0)       NTFS:\WINDOWS\security
+Worker_06       3143072 idle            1.2 GiB         4267 (0)        66089 (0)       NTFS:\WINDOWS\ServicePackFiles
+
+Processing completed.
+```
+
+The status window includes information, such as:
+
+* how many workers were started up;
+* what the process identifier (PID) of the worker processes are;
+* how many events in total and each one of the workers has extracted;
+* what the last file entry was a worker was extracting events from.
+
+The input in the previous example was a storage media image with a single
+partition, which was running a Windows XP system on it. The first thing the
+log2timeline.py does is to scan the storage media file, if it discovers more
+than a single partition, an encrypted partition or that the partition contains
+Volume Shadow Copies (VSS) it will ask the user for further details, for
+example:
+
+```bash
+$ log2timeline.py --storage-file timeline.plaso bde_enabled_windows.dd
+
+The following partitions were found:
+Identifier      Offset (in bytes)       Size (in bytes)
+p1              1048576 (0x00100000)    350.0MiB / 367.0MB (367001600 B)
+p2              368050176 (0x15f00000)  148.7GiB / 159.7GB (159671910400 B)
+
+Please specify the identifier of the partition that should be processed.
+All partitions can be defined as: "all". Note that you can abort with Ctrl^C.
+p2
+
+Found a BitLocker encrypted volume.
+Supported credentials:
+
+  0. startup_key
+  1. recovery_password
+  2. password
+  3. skip
+
+Note that you can abort with Ctrl^C.
+
+Select a credential to unlock the volume:
+```
+
+Note that there are various options that can be used to prevent
+log2timeline.py from prompting the user to select VSS stores or
+partitions.
+
+* **--partitions PARTITION_NUMBERS**: Preselects the partition number to use, eg: `--partitions 2` will pick the second partition on the disk.
+* **--volumes VOLUMES**: Preselects the volumes to process, such as the volumes in an APFS container or LVM volume group, eg: `--volumes 1,3` or `--volumes all`.
+* **--vss_stores**: Selects the VSS stores to include, eg: `--vss_stores all` will select all available VSS stores, or `--vss_stores 1,4,5` (only first, fourth and fifth), or `--vss_stores 1..3` (first three stores) or `--vss_stores=none` will ignore available VSS stores.
+* **--vss_only**: Do not process the current volume if VSS stores have been selected.
+* **--credential TYPE:DATA**: Defines a credential to unlock an encrypted volume, such as BitLocker, eg: `--credential password:BDE-test`. Supported credential types are: key_data, password, recovery_password and startup_key. Binary key data is expected in hexadecimal (BASE-16) encoding. Note that credentials passed on the command line can end up in logs, such as the shell history.
+* **--unattended**: log2timeline.py will error instead of prompting the user.
+
+After finding a partition to process log2timeline.py will start the
+pre-processing stage, where it collects information from the storage media.
+That is evident by the entries like:
+
+```bash
+2015-07-16 16:54:05,368 [INFO] (MainProcess) PID:98252 <interface> [PreProcess] Set attribute: hostname to N-1A9ODN6ZXK4LQ
+```
+
+Here log2timeline.py detected that the hostname from the Windows installation
+in this partition is: **N-1A9ODN6ZXK4LQ**.
+
+Note that the pre-processing will also determine the most appropriate
+[parser preset](Parsers-and-plugins.md#parser-presets-plaso-data-presets-yaml).
+The parser preset defines which parser are enabled. The auto-detection can be
+overwritten with the `--parsers` option, see [parsers and presets](#parsers-and-presets).
+
+After that the tool spins up several worker processes (the actual number
+depends on the number of CPUs on the system running the tool, see `--workers`).
+The workers are coordinated by the main (foreman) process, which also writes
+the results to the storage file. The status view shows the main process as
+"Main" and the workers as "Worker_00", "Worker_01", etc.
+
+## Parsers and presets
+
+A parser extracts events from a specific data format, for example `winevtx`
+for Windows XML EventLog (EVTX) files. Several parsers, such as `sqlite`,
+`winreg` and `text`, use parser plugins to support the many variants of
+their data format. A parser preset is a named list of parsers and parser
+plugins, for example `win7`.
+
+The [parsers and plugins](Parsers-and-plugins.md) page lists the available
+parsers, parser plugins and presets. The same list is shown by:
+
+```bash
+$ log2timeline.py --parsers list
+```
+
+### How the parsers are selected
+
+log2timeline.py determines the parsers and parser plugins to use as follows:
+
+1. If the `--parsers` option is set, its expression is used.
+2. Otherwise, if pre-processing determined the operating system of the source, every preset that defines a matching operating system is used, for example `win7` for Windows NT.
+3. Otherwise, all parsers and parser plugins are used.
+
+Also see [Internals](../developer/Internals.md).
+
+### The parsers option
+
+The `--parsers` option takes a comma separated list of preset, parser and
+parser plugin names. Names are case insensitive.
+
+* A parser plugin is specified as the parser name and the plugin name separated by a `/`, for example `sqlite/chrome_27_history` or `text/winiis`.
+* A parser specified without a plugin name enables all of its plugins, for example `sqlite`.
+* A preset is expanded to the parsers and parser plugins it defines. Presets can contain other presets, for example `win7` contains `win_gen`.
+* An element prefixed with `!` is excluded. Exclusions take precedence over inclusions.
+* A parser plugin can only be excluded if its parser is also included, otherwise log2timeline.py will report an error.
+
+Note that shells such as bash and zsh apply history expansion to an
+exclamation mark, also inside double quotes, which results in an error like
+"event not found". Escaping the exclamation mark with a backslash inside
+double quotes does not help either, since bash then passes on the backslash.
+Use single quotes for an expression that contains an exclusion.
+
+For example:
+
+```bash
+$ log2timeline.py --parsers 'linux,!text/bash_history' --storage-file timeline.plaso image.raw
+$ log2timeline.py --parsers 'sqlite,!sqlite/chrome_27_history' --storage-file timeline.plaso image.raw
+$ log2timeline.py --parsers "win7,text/syslog" --storage-file timeline.plaso image.raw
+```
+
+### The presets file
+
+The presets are defined in the `presets.yaml` file in the data directory,
+[plaso/data/presets.yaml](https://github.com/log2timeline/plaso/blob/main/plaso/data/presets.yaml)
+in the source. A different data directory can be specified with the `--data`
+option.
+
+The file contains a YAML document per preset, for example:
+
+```yaml
+name: winxp
+description: Preset for Windows 2000, Windows XP and Windows 2003.
+operating_systems:
+- {product: Windows 2000}
+- {product: Windows XP}
+- {product: Windows 2003}
+parsers:
+- recycle_bin_info2
+- rplog
+- win_gen
+- winevt
+```
+
+Key | Description
+--- | ---
+name | Name of the preset, which is required.
+description | Description of the preset.
+operating_systems | Optional list of operating systems the preset is used for when the `--parsers` option is not set. Each operating system is defined by a `family`, such as `Windows NT`, `Linux` or `MacOS`, and/or a `product`, such as `Windows XP`, and an optional `version`.
+parsers | List of preset, parser and parser plugin names, which is required.
+deprecated | Optional, `true` if the preset is deprecated. Using a deprecated preset will log a warning.
+
+## The info option
+
+The first option is the `--info` which prints out information about the
+versions and all supported hashers, parsers, parser plugins and parser presets.
+
+```bash
+$ log2timeline.py --info
+======================== log2timeline/plaso information ========================
+
+*********************************** Versions ***********************************
+        Name : Description
+--------------------------------------------------------------------------------
+plaso engine : 20261025
+      python : 3.14.5 (main, May 10 2026, 19:28:16) [Clang 22.1.3 ]
+--------------------------------------------------------------------------------
+
+*********************************** Hashers ************************************
+   Name : Description
+--------------------------------------------------------------------------------
+entropy : Calculates the byte entropy of input data.
+    md5 : Calculates an MD5 digest hash over input data.
+   sha1 : Calculates a SHA-1 digest hash over input data.
+ sha256 : Calculates a SHA-256 digest hash over input data.
+--------------------------------------------------------------------------------
+
+*********************************** Parsers ************************************
+                 Name : Description
+--------------------------------------------------------------------------------
+    android_app_usage : Parser for Android usage history (usage-history.xml)
+                        files.
+              asl_log : Parser for Apple System Log (ASL) files.
+...
+```
+
+## The logfile option
+
+Another useful option to use is the `--logfile`. This will redirect all log
+messages from log2timeline.py to a file. This can be coupled with `-d` if
+you wish to get more detailed debug information.
+
+```bash
+$ log2timeline.py --logfile test.log --storage-file timeline.plaso test.vhd
+```
+
+Note that the foreman (main process) and each worker will have a separate log
+file. If the .log.gz extension is used log2timeline.py will create a compressed
+log file.
+
+## Using filter files for triage
+
+Sometimes you may not want to do a complete timeline that extracts events from
+every discovered file. To do more targeted extraction a YAML-based filter file
+can be used with the `--file-filter` (or `-f`) option.
+
+```bash
+$ log2timeline.py --file-filter filter.yaml --storage-file timeline.plaso test.vhd
+Source path             : /PATH/test.vhd
+Source type             : storage media image
+Filter file             : filter.yaml
+Processing time         : 00:00:00
+
+Processing started.
+...
+Processing completed.
+```
+
+Instead of processing all the files only the file paths included in the filter
+file will be used. Here the content is:
+
+```bash
+$ cat filter.yaml
+description: Files in a_directory.
+type: include
+paths:
+- '/a_directory/.+'
+```
+
+This can be verified against the event sources:
+
+```bash
+$ pinfo.py --sections sources timeline.plaso
+```
+
+Plaso also provides example filter files, such as [filter_windows.yaml](https://github.com/log2timeline/plaso/blob/main/plaso/data/filter_windows.yaml)
+for the triage of Windows systems.
+
+More information about the collection filters and the format of filter files
+can be found [here](Collection-Filters.md).

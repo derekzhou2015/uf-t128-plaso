@@ -1,0 +1,629 @@
+#!/usr/bin/env python3
+"""Tests for the output and formatting multi-processing engine."""
+
+import io
+import os
+import unittest
+
+from plaso.cli import time_slices
+from plaso.containers import events
+from plaso.engine import configurations
+from plaso.filters import event_filter
+from plaso.lib import definitions
+from plaso.multi_process import output_engine
+from plaso.output import dynamic
+from plaso.output import interface as output_interface
+from plaso.output import mediator as output_mediator
+from plaso.storage import factory as storage_factory
+
+from tests import test_lib as shared_test_lib
+from tests.containers import test_lib as containers_test_lib
+from tests.multi_process import test_lib
+
+
+class TestOutputModule(output_interface.OutputModule):
+    """Output module for testing.
+
+    Attributes:
+      events (list[tuple[EventObject, EventData]]): event written to the output.
+      macb_groups (list[list[tuple[EventObject, EventData]]]): MACB groups of
+          events written to the output.
+    """
+
+    # pylint: disable=arguments-renamed,unused-argument
+
+    NAME = "psort_test"
+
+    def __init__(self):
+        """Initializes an output module."""
+        super().__init__()
+        self.events = []
+        self.macb_groups = []
+
+    def GetFieldValues(
+        self, output_mediator_object, event, event_data, event_data_stream, event_tag
+    ):
+        """Retrieves the output field values.
+
+        Args:
+          output_mediator_object (OutputMediator): mediates interactions between
+              output modules and other components, such as storage and dfVFS.
+          event (EventObject): event.
+          event_data (EventData): event data.
+          event_data_stream (EventDataStream): event data stream.
+          event_tag (EventTag): event tag.
+
+        Returns:
+          dict[str, str]: output field values per name.
+        """
+        field_values = {}
+        if event_data_stream:
+            field_values["md5_hash"] = event_data_stream.md5_hash
+
+        return field_values
+
+    def WriteFieldValues(self, output_mediator_object, field_values):
+        """Writes field values to the output.
+
+        Args:
+          output_mediator_object (OutputMediator): mediates interactions between
+              output modules and other components, such as storage and dfVFS.
+          field_values (dict[str, str]): output field values per name.
+        """
+        self.events.append(field_values)
+
+    def WriteFieldValuesOfMACBGroup(self, output_mediator_object, macb_group):
+        """Writes field values of a MACB group to the output.
+
+        Args:
+          output_mediator_object (OutputMediator): mediates interactions between
+              output modules and other components, such as storage and dfVFS.
+          macb_group (list[dict[str, str]]): group of output field values per name
+              with identical timestamps, attributes and values.
+        """
+        self.events.extend(macb_group)
+        self.macb_groups.append(macb_group)
+
+    def WriteHeader(self, output_mediator_object):
+        """Writes the header to the output.
+
+        Args:
+          output_mediator_object (OutputMediator): mediates interactions between
+              output modules and other components, such as storage and dfVFS.
+        """
+        return
+
+
+class TestOutputEngine(output_engine.OutputAndFormattingMultiProcessEngine):
+    """Output engine for testing with a small event data prefetch size."""
+
+    # pylint: disable=abstract-method
+
+    _EVENT_DATA_PREFETCH_SIZE = 4
+
+
+class PsortEventHeapTest(test_lib.MultiProcessingTestCase):
+    """Tests for the psort events heap."""
+
+    # pylint: disable=protected-access
+
+    _TEST_EVENTS = [
+        {
+            "data_type": "test:event",
+            "timestamp": 5134324321,
+            "timestamp_desc": definitions.TIME_DESCRIPTION_METADATA_MODIFICATION,
+        },
+        {
+            "_parser_chain": "test_parser",
+            "data_type": "test:event",
+            "display_name": "/dev/none",
+            "filename": "/dev/none",
+            "text": "text",
+            "timestamp": 2345871286,
+            "timestamp_desc": definitions.TIME_DESCRIPTION_METADATA_MODIFICATION,
+            "var": "Issue: False, Closed: True",
+        },
+    ]
+
+    def testNumberOfEvents(self):
+        """Tests the number_of_events property."""
+        event_heap = output_engine.PsortEventHeap()
+        self.assertEqual(event_heap.number_of_events, 0)
+
+    def testPopEvent(self):
+        """Tests the PopEvent function."""
+        event_heap = output_engine.PsortEventHeap()
+
+        self.assertEqual(len(event_heap._heap), 0)
+
+        test_event = event_heap.PopEvent()
+        self.assertIsNone(test_event)
+
+        for (
+            event,
+            event_data,
+            event_data_stream,
+        ) in containers_test_lib.CreateEventsFromValues(self._TEST_EVENTS):
+            event_heap.PushEvent(event, event_data, event_data_stream)
+
+        self.assertEqual(len(event_heap._heap), 2)
+
+        test_event = event_heap.PopEvent()
+        self.assertIsNotNone(test_event)
+
+        self.assertEqual(len(event_heap._heap), 1)
+
+    def testPopEvents(self):
+        """Tests the PopEvents function."""
+        event_heap = output_engine.PsortEventHeap()
+
+        self.assertEqual(len(event_heap._heap), 0)
+
+        test_events = list(event_heap.PopEvents())
+        self.assertEqual(len(test_events), 0)
+
+        for (
+            event,
+            event_data,
+            event_data_stream,
+        ) in containers_test_lib.CreateEventsFromValues(self._TEST_EVENTS):
+            event_heap.PushEvent(event, event_data, event_data_stream)
+
+        self.assertEqual(len(event_heap._heap), 2)
+
+        test_events = list(event_heap.PopEvents())
+        self.assertEqual(len(test_events), 2)
+
+        self.assertEqual(len(event_heap._heap), 0)
+
+    def testPushEvent(self):
+        """Tests the PushEvent function."""
+        event_heap = output_engine.PsortEventHeap()
+
+        self.assertEqual(len(event_heap._heap), 0)
+
+        event, event_data, event_data_stream = (
+            containers_test_lib.CreateEventFromValues(self._TEST_EVENTS[0])
+        )
+        event_heap.PushEvent(event, event_data, event_data_stream)
+
+        self.assertEqual(len(event_heap._heap), 1)
+
+
+class OutputAndFormattingMultiProcessEngineTest(test_lib.MultiProcessingTestCase):
+    """Tests for the multi-processing engine."""
+
+    # pylint: disable=protected-access
+
+    _TEST_EVENTS = [
+        {
+            "data_type": "test:event",
+            "timestamp": 5134324321,
+            "timestamp_desc": definitions.TIME_DESCRIPTION_WRITTEN,
+        },
+        {
+            "data_type": "test:event",
+            "timestamp": 5134324321,
+            "timestamp_desc": definitions.TIME_DESCRIPTION_LAST_ACCESS,
+        },
+        {
+            "data_type": "test:event",
+            "timestamp": 2134324321,
+            "timestamp_desc": definitions.TIME_DESCRIPTION_UNKNOWN,
+        },
+        {
+            "data_type": "test:event",
+            "timestamp": 9134324321,
+            "timestamp_desc": definitions.TIME_DESCRIPTION_UNKNOWN,
+        },
+        {
+            "data_type": "test:event",
+            "timestamp": 5134324321,
+            "timestamp_desc": definitions.TIME_DESCRIPTION_METADATA_MODIFICATION,
+        },
+        {
+            "data_type": "test:event",
+            "timestamp": 5134324321,
+            "timestamp_desc": definitions.TIME_DESCRIPTION_CREATION,
+        },
+        {
+            "data_type": "test:event",
+            "timestamp": 15134324321,
+            "timestamp_desc": definitions.TIME_DESCRIPTION_UNKNOWN,
+        },
+        {
+            "data_type": "test:event",
+            "timestamp": 5134324322,
+            "timestamp_desc": definitions.TIME_DESCRIPTION_CREATION,
+        },
+        {
+            "data_type": "test:event",
+            "timestamp": 5134324322,
+            "timestamp_desc": definitions.TIME_DESCRIPTION_LAST_ACCESS,
+        },
+        {
+            "data_type": "test:event",
+            "timestamp": 5134324322,
+            "timestamp_desc": definitions.TIME_DESCRIPTION_METADATA_MODIFICATION,
+        },
+        {
+            "data_type": "test:event",
+            "timestamp": 5134324322,
+            "timestamp_desc": definitions.TIME_DESCRIPTION_WRITTEN,
+        },
+        {
+            "data_type": "test:event",
+            "timestamp": 5134324322,
+            "timestamp_desc": definitions.TIME_DESCRIPTION_WRITTEN,
+        },
+        {
+            "data_type": "test:event",
+            "timestamp": 5134324322,
+            "text": "Another text",
+            "timestamp_desc": definitions.TIME_DESCRIPTION_LAST_ACCESS,
+        },
+        {
+            "data_type": "test:event",
+            "timestamp": 5134324322,
+            "text": "Another text",
+            "timestamp_desc": definitions.TIME_DESCRIPTION_METADATA_MODIFICATION,
+        },
+        {
+            "data_type": "test:event",
+            "text": "Another text",
+            "timestamp": 5134324322,
+            "timestamp_desc": definitions.TIME_DESCRIPTION_WRITTEN,
+        },
+        {
+            "data_type": "test:event",
+            "timestamp": 5134024321,
+            "timestamp_desc": definitions.TIME_DESCRIPTION_UNKNOWN,
+        },
+        {
+            "data_type": "test:event",
+            "timestamp": 5134024321,
+            "timestamp_desc": definitions.TIME_DESCRIPTION_UNKNOWN,
+        },
+    ]
+
+    def _CreateTestStorageFile(self, path, event_values_list=None):
+        """Creates a storage file for testing.
+
+        Args:
+          path (str): path.
+          event_values_list (Optional[list[dict[str, str]]]): list of event
+              values, where None represents the default test events.
+        """
+        storage_file = storage_factory.StorageFactory.CreateStorageFile(
+            definitions.DEFAULT_STORAGE_FORMAT
+        )
+        storage_file.Open(path=path, read_only=False)
+
+        # TODO: add preprocessing information.
+
+        for (
+            event,
+            event_data,
+            event_data_stream,
+        ) in containers_test_lib.CreateEventsFromValues(
+            event_values_list or self._TEST_EVENTS
+        ):
+            storage_file.AddAttributeContainer(event_data_stream)
+
+            event_data.SetEventDataStreamIdentifier(event_data_stream.GetIdentifier())
+            storage_file.AddAttributeContainer(event_data)
+
+            event.SetEventDataIdentifier(event_data.GetIdentifier())
+            storage_file.AddAttributeContainer(event)
+
+        storage_file.Close()
+
+    # TODO: add test for _ExportEvent.
+
+    def testGetEventTag(self):
+        """Tests the _GetEventTag function."""
+        test_engine = output_engine.OutputAndFormattingMultiProcessEngine()
+
+        with shared_test_lib.TempDirectory() as temp_directory:
+            temp_file = os.path.join(temp_directory, "storage.plaso")
+            self._CreateTestStorageFile(temp_file)
+
+            storage_file = storage_factory.StorageFactory.CreateStorageFile(
+                definitions.DEFAULT_STORAGE_FORMAT
+            )
+            storage_file.Open(path=temp_file, read_only=False)
+
+            storage_reader_events = list(storage_file.GetSortedEvents())
+            event_tag = events.EventTag()
+            event_tag.SetEventIdentifier(storage_reader_events[1].GetIdentifier())
+            event_tag.AddLabel("test_label")
+            storage_file.AddAttributeContainer(event_tag)
+            storage_file.Close()
+
+            storage_reader = storage_factory.StorageFactory.CreateStorageReaderForFile(
+                temp_file
+            )
+
+            event_tags = [
+                test_engine._GetEventTag(storage_reader, event)
+                for event in storage_reader.GetSortedEvents()
+            ]
+
+        self.assertIsNone(event_tags[0])
+        self.assertEqual(event_tags[1].labels, ["test_label"])
+        self.assertEqual(event_tags.count(None), len(event_tags) - 1)
+
+    def testGetSortedEvents(self):
+        """Tests the _GetSortedEvents function."""
+        test_engine = TestOutputEngine()
+
+        with shared_test_lib.TempDirectory() as temp_directory:
+            temp_file = os.path.join(temp_directory, "storage.plaso")
+            self._CreateTestStorageFile(temp_file)
+
+            storage_reader = storage_factory.StorageFactory.CreateStorageReaderForFile(
+                temp_file
+            )
+
+            try:
+                expected_identifiers = [
+                    event.GetIdentifier().CopyToString()
+                    for event in storage_reader.GetSortedEvents()
+                ]
+                identifiers = [
+                    event.GetIdentifier().CopyToString()
+                    for event in test_engine._GetSortedEvents(storage_reader)
+                ]
+
+                cached_event_data = storage_reader._store._GetCachedAttributeContainer(
+                    events.EventData.CONTAINER_TYPE, 0
+                )
+                self.assertIsNotNone(cached_event_data)
+
+            finally:
+                storage_reader.Close()
+
+        self.assertEqual(len(identifiers), 17)
+        self.assertEqual(identifiers, expected_identifiers)
+
+    def testInternalExportEvents(self):
+        """Tests the _ExportEvents function."""
+        formatters_directory_path = self._GetDataFilePath(["formatters"])
+
+        output_module = TestOutputModule()
+
+        test_engine = output_engine.OutputAndFormattingMultiProcessEngine()
+
+        with shared_test_lib.TempDirectory() as temp_directory:
+            temp_file = os.path.join(temp_directory, "storage.plaso")
+            self._CreateTestStorageFile(temp_file)
+
+            storage_reader = storage_factory.StorageFactory.CreateStorageReaderForFile(
+                temp_file
+            )
+
+            output_mediator_object = output_mediator.OutputMediator(
+                storage_reader, data_location=shared_test_lib.TEST_DATA_PATH
+            )
+            output_mediator_object.ReadMessageFormattersFromDirectory(
+                formatters_directory_path
+            )
+
+            test_engine._ExportEvents(
+                storage_reader, output_module, deduplicate_events=False
+            )
+
+        self.assertEqual(len(output_module.events), 17)
+        self.assertEqual(len(output_module.macb_groups), 3)
+
+    def testInternalExportEventsDeduplicate(self):
+        """Tests the _ExportEvents function with deduplication."""
+        formatters_directory_path = self._GetDataFilePath(["formatters"])
+
+        output_module = TestOutputModule()
+
+        test_engine = output_engine.OutputAndFormattingMultiProcessEngine()
+
+        with shared_test_lib.TempDirectory() as temp_directory:
+            temp_file = os.path.join(temp_directory, "storage.plaso")
+            self._CreateTestStorageFile(temp_file)
+
+            storage_reader = storage_factory.StorageFactory.CreateStorageReaderForFile(
+                temp_file
+            )
+
+            output_mediator_object = output_mediator.OutputMediator(
+                storage_reader, data_location=shared_test_lib.TEST_DATA_PATH
+            )
+
+            output_mediator_object.ReadMessageFormattersFromDirectory(
+                formatters_directory_path
+            )
+
+            test_engine._ExportEvents(storage_reader, output_module)
+
+        self.assertEqual(len(output_module.events), 15)
+        self.assertEqual(len(output_module.macb_groups), 3)
+
+    def testInternalExportEventsWithTimeSlicer(self):
+        """Tests the _ExportEvents function with the time slicer."""
+        test_events = [
+            {
+                "data_type": "test:event",
+                "md5_hash": "11111111111111111111111111111111",
+                "text": "context",
+                "timestamp": 5134324321,
+                "timestamp_desc": definitions.TIME_DESCRIPTION_UNKNOWN,
+            },
+            {
+                "data_type": "test:event",
+                "md5_hash": "22222222222222222222222222222222",
+                "text": "match",
+                "timestamp": 5134324322,
+                "timestamp_desc": definitions.TIME_DESCRIPTION_UNKNOWN,
+            },
+        ]
+
+        test_filter = event_filter.EventObjectFilter()
+        test_filter.CompileFilter('text is "match"')
+
+        time_slice = time_slices.TimeSlice(None)
+
+        output_module = TestOutputModule()
+
+        test_engine = output_engine.OutputAndFormattingMultiProcessEngine()
+
+        with shared_test_lib.TempDirectory() as temp_directory:
+            temp_file = os.path.join(temp_directory, "storage.plaso")
+            self._CreateTestStorageFile(temp_file, event_values_list=test_events)
+
+            storage_reader = storage_factory.StorageFactory.CreateStorageReaderForFile(
+                temp_file
+            )
+
+            test_engine._ExportEvents(
+                storage_reader,
+                output_module,
+                event_filter=test_filter,
+                time_slice=time_slice,
+                use_time_slicer=True,
+            )
+
+        expected_events = [
+            {"md5_hash": "11111111111111111111111111111111"},
+            {"md5_hash": "22222222222222222222222222222222"},
+        ]
+        self.assertEqual(output_module.events, expected_events)
+
+    def testInternalFlushExportBuffer(self):
+        """Tests the _FlushExportBuffer function."""
+        test_events = [
+            {
+                "data_type": "test:event",
+                "md5_hash": "11111111111111111111111111111111",
+                "timestamp": 5134324321,
+                "timestamp_desc": definitions.TIME_DESCRIPTION_UNKNOWN,
+            },
+            {
+                "data_type": "test:event",
+                "md5_hash": "11111111111111111111111111111111",
+                "timestamp": 5134324321,
+                "timestamp_desc": definitions.TIME_DESCRIPTION_UNKNOWN,
+            },
+            {
+                "data_type": "test:event",
+                "md5_hash": "22222222222222222222222222222222",
+                "timestamp": 5134324321,
+                "timestamp_desc": definitions.TIME_DESCRIPTION_CREATION,
+            },
+            {
+                "data_type": "test:event",
+                "md5_hash": "22222222222222222222222222222222",
+                "timestamp": 5134324321,
+                "timestamp_desc": definitions.TIME_DESCRIPTION_LAST_ACCESS,
+            },
+        ]
+
+        for deduplicate_events, expected_number_of_written_events in (
+            (True, 1),
+            (False, 2),
+        ):
+            output_module = TestOutputModule()
+
+            test_engine = output_engine.OutputAndFormattingMultiProcessEngine()
+
+            for (
+                event,
+                event_data,
+                event_data_stream,
+            ) in containers_test_lib.CreateEventsFromValues(test_events):
+                test_engine._export_event_heap.PushEvent(
+                    event, event_data, event_data_stream
+                )
+
+            test_engine._FlushExportBuffer(
+                None,
+                output_module,
+                deduplicate_events=deduplicate_events,
+                resolve_event_tag=False,
+            )
+
+            self.assertEqual(test_engine._export_event_heap.number_of_events, 0)
+
+            written_events = [
+                field_values
+                for field_values in output_module.events
+                if isinstance(field_values, dict)
+            ]
+            expected_written_events = [
+                {"md5_hash": "11111111111111111111111111111111"}
+            ] * expected_number_of_written_events
+            self.assertEqual(written_events, expected_written_events)
+
+            self.assertEqual(len(output_module.macb_groups), 1)
+
+            macb_group = output_module.macb_groups[0]
+            self.assertEqual(len(macb_group), 2)
+
+            timestamp_descriptions = sorted(
+                macb_event.timestamp_desc for macb_event, _, _, _ in macb_group
+            )
+            self.assertEqual(
+                timestamp_descriptions,
+                [
+                    definitions.TIME_DESCRIPTION_CREATION,
+                    definitions.TIME_DESCRIPTION_LAST_ACCESS,
+                ],
+            )
+
+            events_status = test_engine._events_status
+            self.assertEqual(
+                events_status.number_of_duplicate_events,
+                2 - expected_number_of_written_events,
+            )
+            self.assertEqual(events_status.number_of_macb_grouped_events, 2)
+
+    def testExportEvents(self):
+        """Tests the ExportEvents function."""
+        test_file_path = self._GetTestFilePath(["psort_test.plaso"])
+        self._SkipIfPathNotExists(test_file_path)
+
+        test_file_object = io.StringIO()
+
+        storage_reader = storage_factory.StorageFactory.CreateStorageReaderForFile(
+            test_file_path
+        )
+
+        output_module = dynamic.DynamicOutputModule()
+        output_module._file_object = test_file_object
+
+        configuration = configurations.ProcessingConfiguration()
+        configuration.data_location = shared_test_lib.DATA_PATH
+        configuration.preferred_language = "en-US"
+
+        test_engine = output_engine.OutputAndFormattingMultiProcessEngine()
+
+        test_engine.ExportEvents(storage_reader, output_module, configuration)
+
+        output = test_file_object.getvalue()
+        lines = output.split("\n")
+
+        self.assertEqual(len(lines), 22)
+
+        expected_line = ",".join(
+            [
+                "2014-11-18T01:15:43.000000+00:00",
+                "Content Modification Time",
+                "LOG",
+                "Log File",
+                "[---] last message repeated 5 times ---",
+                "text/syslog_traditional",
+                "OS:/tmp/test/test_data/syslog/syslog",
+                "repeated",
+            ]
+        )
+        self.assertEqual(lines[14], expected_line)
+
+
+if __name__ == "__main__":
+    unittest.main()

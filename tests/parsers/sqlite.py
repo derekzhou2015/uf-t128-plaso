@@ -1,0 +1,298 @@
+#!/usr/bin/env python3
+"""Tests for the SQLite database parser."""
+
+import io
+import os
+import sqlite3
+import stat
+import sys
+import tempfile
+import unittest
+
+from plaso.parsers import sqlite
+
+# Register all plugins.
+from plaso.parsers import sqlite_plugins  # pylint: disable=unused-import
+
+from tests.parsers import test_lib
+
+
+class SQLiteDatabaseTest(test_lib.ParserTestCase):
+    """Tests for the SQLite database."""
+
+    # pylint: disable=protected-access
+
+    # TODO: add tests for tables property
+
+    def testCopyFileObjectToTemporaryFile(self):
+        """Tests the _CopyFileObjectToTemporaryFile function."""
+        database = sqlite.SQLiteDatabase("test.db")
+
+        # Use data larger than the read buffer to test multiple reads.
+        test_data = bytes(range(256)) * 300
+        self.assertGreater(len(test_data), database._READ_BUFFER_SIZE)
+
+        file_object = io.BytesIO(test_data)
+
+        # The copy should start at the beginning of the file-like object.
+        file_object.seek(1024, os.SEEK_SET)
+
+        temporary_file = io.BytesIO()
+        database._CopyFileObjectToTemporaryFile(file_object, temporary_file)
+        self.assertEqual(temporary_file.getvalue(), test_data)
+
+        file_object = io.BytesIO(b"")
+        temporary_file = io.BytesIO()
+        database._CopyFileObjectToTemporaryFile(file_object, temporary_file)
+        self.assertEqual(temporary_file.getvalue(), b"")
+
+    # TODO: add tests for Open and Close
+
+    def testOpenClose(self):
+        """Tests the Open and Close functions."""
+        database_file_path = self._GetTestFilePath(["android", "contacts2.db"])
+        self._SkipIfPathNotExists(database_file_path)
+
+        database = sqlite.SQLiteDatabase("contacts2.db")
+        with open(database_file_path, "rb") as database_file_object:
+            database.Open(database_file_object)
+            database.Close()
+
+    def testOpenCloseOnDatabaseWithDotInTableName(self):
+        """Tests Open and Close on a database with a dot in a table name."""
+        database_file_path = self._GetTestFilePath(["data.db"])
+        self._SkipIfPathNotExists(database_file_path)
+
+        database = sqlite.SQLiteDatabase("data.db")
+        with open(database_file_path, "rb") as database_file_object:
+            database.Open(database_file_object)
+            database.Close()
+
+    def testOpenCloseOnDatabaseWithDoubleQuoteInTableName(self):
+        """Tests Open and Close on a database with a double quote in a table name."""
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            database_file_path = os.path.join(temporary_directory, "events.db")
+
+            connection = sqlite3.connect(database_file_path)
+            connection.execute('CREATE TABLE "events""log" (field1 INTEGER)')
+            connection.commit()
+            connection.close()
+
+            with open(database_file_path, "rb") as file_object:
+                database_file_object = io.BytesIO(file_object.read())
+
+        database = sqlite.SQLiteDatabase("events.db")
+        database.Open(database_file_object)
+
+        try:
+            self.assertIn('events"log', database.tables)
+            self.assertEqual(database.columns_per_table['events"log'], ["field1"])
+        finally:
+            database.Close()
+
+    def testQueryOnDatabaseWithWAL(self):
+        """Tests the Query function on a database with a WAL file."""
+        database_file_path = self._GetTestFilePath(["wal_database.db"])
+        self._SkipIfPathNotExists(database_file_path)
+
+        database_wal_file_path = self._GetTestFilePath(["wal_database.db-wal"])
+        self._SkipIfPathNotExists(database_wal_file_path)
+
+        database = sqlite.SQLiteDatabase("wal_database.db")
+        with open(database_file_path, "rb") as database_file_object:
+            with open(database_wal_file_path, "rb") as wal_file_object:
+                database.Open(database_file_object, wal_file_object=wal_file_object)
+
+        row_results = []
+        for row in database.Query("SELECT * FROM MyTable"):
+            row_results.append((row["Field1"], row["Field2"], row["Field3"]))
+
+        expected_results = [
+            ("Committed Text 1", 1, None),
+            ("Committed Text 2", 2, None),
+            ("Modified Committed Text 3", 4, None),
+            ("Committed Text 4", 5, None),
+            ("Committed Text 5", 7, None),
+            ("Committed Text 6", 8, None),
+            ("Committed Text 7", 9, None),
+            ("Unhashable Row 1", 10, b"Binary Text!\x01\x02\x03"),
+            ("Unhashable Row 2", 11, b"More Binary Text!\x01\x02\x03"),
+            ("New Text 1", 12, None),
+            ("New Text 2", 13, None),
+        ]
+        self.assertEqual(expected_results, row_results)
+
+    @unittest.skipIf(
+        sys.platform.startswith("win"),
+        "POSIX file mode bits are not meaningful on Windows.",
+    )
+    def testOpenWithWALRestrictsTemporaryFileMode(self):
+        """Tests that the temporary WAL copy is created with mode 0600."""
+        database_file_path = self._GetTestFilePath(["wal_database.db"])
+        self._SkipIfPathNotExists(database_file_path)
+
+        database_wal_file_path = self._GetTestFilePath(["wal_database.db-wal"])
+        self._SkipIfPathNotExists(database_wal_file_path)
+
+        database = sqlite.SQLiteDatabase("wal_database.db")
+
+        # Force a permissive umask so the assertion exercises the explicit mode
+        # instead of whatever the environment happens to mask off.
+        original_umask = os.umask(0o022)
+        try:
+            with open(database_file_path, "rb") as database_file_object:
+                with open(database_wal_file_path, "rb") as wal_file_object:
+                    database.Open(database_file_object, wal_file_object=wal_file_object)
+
+            # pylint: disable=protected-access
+            temporary_wal_file_path = database._temp_wal_file_path
+            # pylint: enable=protected-access
+            mode = stat.S_IMODE(os.stat(temporary_wal_file_path).st_mode)
+            self.assertEqual(0o600, mode)
+        finally:
+            os.umask(original_umask)
+            database.Close()
+
+    def testQueryOnDatabaseWithoutWAL(self):
+        """Tests the Query function on a database without a WAL file."""
+        database_file_path = self._GetTestFilePath(["wal_database.db"])
+        self._SkipIfPathNotExists(database_file_path)
+
+        database = sqlite.SQLiteDatabase("wal_database.db")
+        with open(database_file_path, "rb") as database_file_object:
+            database.Open(database_file_object)
+
+        row_results = []
+        for row in database.Query("SELECT * FROM MyTable"):
+            row_results.append((row["Field1"], row["Field2"], row["Field3"]))
+
+        expected_results = [
+            ("Committed Text 1", 1, None),
+            ("Committed Text 2", 2, None),
+            ("Deleted Text 1", 3, None),
+            ("Committed Text 3", 4, None),
+            ("Committed Text 4", 5, None),
+            ("Deleted Text 2", 6, None),
+            ("Committed Text 5", 7, None),
+            ("Committed Text 6", 8, None),
+            ("Committed Text 7", 9, None),
+            ("Unhashable Row 1", 10, b"Binary Text!\x01\x02\x03"),
+        ]
+        self.assertEqual(expected_results, row_results)
+
+
+class SQLiteParserTest(test_lib.ParserTestCase):
+    """Tests for the SQLite database parser."""
+
+    # pylint: disable=protected-access
+
+    def testOpenDatabaseWithWAL(self):
+        """Tests the _OpenDatabaseWithWAL function."""
+        parser = sqlite.SQLiteParser()
+
+        storage_writer = self._CreateStorageWriter()
+        parser_mediator = self._CreateParserMediator(storage_writer)
+
+        test_file_path = self._GetTestFilePath(["wal_database.db-wal"])
+        self._SkipIfPathNotExists(test_file_path)
+
+        file_entry = self._GetTestFileEntry(["wal_database.db"])
+        file_object = file_entry.GetFileObject()
+
+        database, wal_file_entry = parser._OpenDatabaseWithWAL(
+            parser_mediator, file_entry, file_object, "wal_database.db"
+        )
+        self.assertIsNotNone(database)
+        self.assertIsNotNone(wal_file_entry)
+
+        try:
+            self.assertEqual(wal_file_entry.name, "wal_database.db-wal")
+
+            row_results = [
+                row["Field1"] for row in database.Query("SELECT Field1 FROM MyTable")
+            ]
+            self.assertIn("New Text 1", row_results)
+            self.assertIn("Modified Committed Text 3", row_results)
+            self.assertNotIn("Deleted Text 1", row_results)
+
+        finally:
+            database.Close()
+
+        # Test with a database without a WAL file.
+        file_entry = self._GetTestFileEntry(["android", "contacts2.db"])
+        file_object = file_entry.GetFileObject()
+
+        database, wal_file_entry = parser._OpenDatabaseWithWAL(
+            parser_mediator, file_entry, file_object, "contacts2.db"
+        )
+        self.assertIsNone(database)
+        self.assertIsNone(wal_file_entry)
+
+        number_of_warnings = storage_writer.GetNumberOfAttributeContainers(
+            "extraction_warning"
+        )
+        self.assertEqual(number_of_warnings, 0)
+
+    def testEnablePlugins(self):
+        """Tests the EnablePlugins function."""
+        parser = sqlite.SQLiteParser()
+
+        number_of_plugins = len(parser._plugin_classes)
+
+        parser.EnablePlugins([])
+        self.assertEqual(len(parser._plugins_per_name), 0)
+
+        parser.EnablePlugins(parser.ALL_PLUGINS)
+        self.assertEqual(len(parser._plugins_per_name), number_of_plugins)
+
+        parser.EnablePlugins(["chrome_27_history"])
+        self.assertEqual(len(parser._plugins_per_name), 1)
+
+    def testGetFormatSpecification(self):
+        """Tests the GetFormatSpecification function."""
+        format_specification = sqlite.SQLiteParser.GetFormatSpecification()
+        self.assertIsNotNone(format_specification)
+
+    def testParseFileEntry(self):
+        """Tests the ParseFileEntry function."""
+        parser = sqlite.SQLiteParser()
+        storage_writer = self._ParseFile(["android", "contacts2.db"], parser)
+
+        number_of_event_data = storage_writer.GetNumberOfAttributeContainers(
+            "event_data"
+        )
+        self.assertEqual(number_of_event_data, 3)
+
+        number_of_warnings = storage_writer.GetNumberOfAttributeContainers(
+            "extraction_warning"
+        )
+        self.assertEqual(number_of_warnings, 0)
+
+        number_of_warnings = storage_writer.GetNumberOfAttributeContainers(
+            "recovery_warning"
+        )
+        self.assertEqual(number_of_warnings, 0)
+
+    def testParseFileEntryOnDatabaseWithDotInTableName(self):
+        """Tests ParseFileEntry on a database with a dot in a table name."""
+        parser = sqlite.SQLiteParser()
+        storage_writer = self._ParseFile(["data.db"], parser)
+
+        number_of_event_data = storage_writer.GetNumberOfAttributeContainers(
+            "event_data"
+        )
+        self.assertEqual(number_of_event_data, 0)
+
+        number_of_warnings = storage_writer.GetNumberOfAttributeContainers(
+            "extraction_warning"
+        )
+        self.assertEqual(number_of_warnings, 0)
+
+        number_of_warnings = storage_writer.GetNumberOfAttributeContainers(
+            "recovery_warning"
+        )
+        self.assertEqual(number_of_warnings, 0)
+
+
+if __name__ == "__main__":
+    unittest.main()
